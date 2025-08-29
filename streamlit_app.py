@@ -3,7 +3,11 @@ import os, io, time, json, base64, random
 from typing import Dict, Any, List
 import streamlit as st
 from PIL import Image
+from pillow_heif import register_heif_opener
 from openai import OpenAI
+
+# HEIC(HEIF) を Pillow で開けるように登録
+register_heif_opener()
 
 # ==============================
 # 1) SRS 復習エンジン（完全版プロンプト）
@@ -209,9 +213,18 @@ SRS_SYSTEM_PROMPT = r"""
 """
 
 # ==============================
-# 2) OpenAI クライアント
+# 2) OpenAI クライアント（Secrets/環境変数対応）
 # ==============================
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+def _get_api_key():
+    return os.getenv("OPENAI_API_KEY") or st.secrets.get("OPENAI_API_KEY")
+
+_api_key = _get_api_key()
+if not _api_key:
+    st.set_page_config(page_title="単語SRS（設定エラー）", page_icon="⚠️")
+    st.error("OPENAI_API_KEY が見つかりません。Streamlit Cloud の『Settings → Secrets』に OPENAI_API_KEY を設定してください。")
+    st.stop()
+
+client = OpenAI(api_key=_api_key)
 
 def now_ms() -> int:
     return int(time.time() * 1000)
@@ -223,7 +236,6 @@ def ocr_with_openai(img: Image.Image) -> str:
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
-    # マルチモーダル入力
     messages = [
         {"role":"system","content":"Extract plain text from the image. Return only raw text."},
         {"role":"user","content":[
@@ -254,11 +266,19 @@ def llm_json(system_prompt: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     try:
         return json.loads(txt)
     except Exception:
-        # JSON失敗時は空セッション
         return {"mode":"serve","session":{"served_at":now_ms(),"items":[]}}
 
 # ==============================
-# 5) 簡易カード生成（OCRテキスト→語群→カード雛形）
+# 5) 画像オープン（HEIC対応）
+# ==============================
+def _open_uploaded_image(uploaded) -> Image.Image:
+    # Streamlit の UploadedFile は bytes を返せる
+    data = uploaded.getvalue()
+    img = Image.open(io.BytesIO(data))
+    return img.convert("RGB")
+
+# ==============================
+# 6) 簡易カード生成（OCRテキスト→語群→カード雛形）
 # ==============================
 def bootstrap_from_text(text: str):
     words = []
@@ -266,10 +286,9 @@ def bootstrap_from_text(text: str):
         token = line.strip().split(" ")[0]
         if token.isalpha() and 2 <= len(token) <= 20:
             words.append(token.lower())
-    # 重複除去
     words = list(dict.fromkeys(words))
-    st.session_state.WORDS += [{"headword": w, "senses": [], "contrast_pairs": []} for w in words]
     t = now_ms()
+    st.session_state.WORDS += [{"headword": w, "senses": [], "contrast_pairs": []} for w in words]
     for w in words:
         st.session_state.CARDS.append({
             "id": f"c_{w}_{t}_{random.randint(100,999)}",
@@ -284,15 +303,15 @@ def bootstrap_from_text(text: str):
         })
 
 # ==============================
-# 6) セッション状態（疑似DB）
+# 7) セッション状態（疑似DB）
 # ==============================
 st.set_page_config(page_title="単語SRS（写真→自動出題）", page_icon="📚", layout="wide")
 st.title("📚 単語SRS（写真→自動出題 / Streamlit Cloud 版）")
 
-if "WORDS" not in st.session_state: st.session_state.WORDS: List[Dict[str,Any]] = []
-if "CARDS" not in st.session_state: st.session_state.CARDS: List[Dict[str,Any]] = []
-if "DUE"   not in st.session_state: st.session_state.DUE:   List[Dict[str,Any]] = []
-if "ANS"   not in st.session_state: st.session_state.ANS:   List[Dict[str,Any]] = []
+if "WORDS" not in st.session_state: st.session_state.WORDS = []
+if "CARDS" not in st.session_state: st.session_state.CARDS = []
+if "DUE"   not in st.session_state: st.session_state.DUE   = []
+if "ANS"   not in st.session_state: st.session_state.ANS   = []
 
 # SRS 設定
 CFG = {
@@ -310,7 +329,7 @@ CFG = {
 }
 
 # ==============================
-# 7) serve / grade ロジック
+# 8) serve / grade ロジック
 # ==============================
 def serve_session():
     out = llm_json(SRS_SYSTEM_PROMPT, {
@@ -357,13 +376,10 @@ def grade_session():
     st.success("採点完了・次回スケジュール更新")
 
 # ==============================
-# 8) データの保存/読み込み（JSON）
+# 9) データの保存/読み込み（JSON）
 # ==============================
 def export_json() -> str:
-    data = {
-        "words": st.session_state.WORDS,
-        "cards": st.session_state.CARDS
-    }
+    data = {"words": st.session_state.WORDS, "cards": st.session_state.CARDS}
     return json.dumps(data, ensure_ascii=False, indent=2)
 
 def import_json(txt: str):
@@ -376,28 +392,40 @@ def import_json(txt: str):
         st.error(f"JSONの読み込みに失敗: {e}")
 
 # ==============================
-# 9) UI
+# 10) UI
 # ==============================
 tab1, tab2, tab3, tab4 = st.tabs(["1) 写真取り込み", "2) 今日の出題", "3) データ", "4) 設定"])
 
 with tab1:
     st.subheader("画像をアップロード or カメラ撮影（スマホOK）")
+
+    # ✅ カメラ常時起動を防ぐ：トグルで表示切替
+    st.session_state.setdefault("use_cam", False)
+    st.session_state.use_cam = st.toggle("📷 カメラを使う", value=st.session_state.use_cam)
+
     col1, col2 = st.columns(2)
     with col1:
-        img_file = st.file_uploader("画像を選択（JPG/PNG）", type=["png","jpg","jpeg"])
+        # ✅ HEICも受け付ける
+        img_file = st.file_uploader("画像を選択（JPG/PNG/HEIC）", type=["png","jpg","jpeg","heic"])
     with col2:
-        cam = st.camera_input("📷 カメラで撮る")
+        cam = st.camera_input("カメラで撮る", key="cam_input") if st.session_state.use_cam else None
 
-    if img_file or cam:
-        img = Image.open(img_file or cam).convert("RGB")
-        st.image(img, caption="プレビュー", use_column_width=True)
-        if st.button("OCRしてカード作成", type="primary"):
-            with st.spinner("OCR中…"):
-                text = ocr_with_openai(img)
-            st.text_area("OCR結果（編集OK）", text, height=200, key="OCR_TEXT")
-            if st.button("↑ このテキストからカード作成"):
-                bootstrap_from_text(st.session_state.get("OCR_TEXT",""))
-                st.success("カードを作成しました → 『2) 今日の出題』へ")
+    # ファイルがあれば優先。どちらもNoneなら何もしない
+    uploaded = img_file or cam
+    if uploaded:
+        try:
+            img = _open_uploaded_image(uploaded)
+            st.image(img, caption="プレビュー", use_column_width=True)
+            if st.button("OCRしてカード作成", type="primary"):
+                with st.spinner("OCR中…"):
+                    text = ocr_with_openai(img)
+                st.text_area("OCR結果（編集OK）", text, height=200, key="OCR_TEXT")
+                if st.button("↑ このテキストからカード作成"):
+                    bootstrap_from_text(st.session_state.get("OCR_TEXT",""))
+                    st.success("カードを作成しました → 『2) 今日の出題』へ")
+        except Exception as e:
+            st.error("画像を開けませんでした（形式未対応/破損の可能性）。別形式で試すか、もう一度撮影してください。")
+            st.caption(f"詳細: {e}")
 
 with tab2:
     st.subheader("今日の出題")
@@ -420,7 +448,7 @@ with tab2:
             key=f"ans_{it.get('card_id')}"
         )
         if ans:
-            # すでに入っていれば置換
+            # 既存解答があれば置換
             st.session_state.ANS = [a for a in st.session_state.ANS if a["card_id"] != it["card_id"]]
             st.session_state.ANS.append({"card_id": it["card_id"], "user_input": ans, "latency_ms": 5000})
 
@@ -431,7 +459,7 @@ with tab3:
     st.json({"CARDS_sample": st.session_state.CARDS[:5]})
 
     st.write("——")
-    dl = st.download_button(
+    st.download_button(
         "📥 JSONエクスポート",
         data=export_json().encode("utf-8"),
         file_name="word_srs_data.json",
@@ -454,4 +482,4 @@ with tab4:
     st.write("間隔（days）:", CFG["leitner_offsets_days"])
 
     st.write("—— 開発者向け ——")
-    st.code("環境変数 OPENAI_API_KEY を Streamlit Cloud の Secrets で設定してね。", language="bash")
+    st.code("Secrets に OPENAI_API_KEY を設定してください。", language="bash")
